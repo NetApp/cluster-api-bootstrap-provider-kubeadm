@@ -100,12 +100,6 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		return ctrl.Result{}, err
 	}
 
-	// bail super early if it's already ready
-	if config.Status.Ready {
-		log.Info("ignoring an already ready config")
-		return ctrl.Result{}, nil
-	}
-
 	// Look up the Machine that owns this KubeConfig if there is one
 	machine, err := util.GetOwnerMachine(ctx, r.Client, config.ObjectMeta)
 	if err != nil {
@@ -117,12 +111,6 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		return ctrl.Result{}, nil
 	}
 	log = log.WithValues("machine-name", machine.Name)
-
-	// Ignore machines that already have bootstrap data
-	if machine.Spec.Bootstrap.Data != nil {
-		// TODO: mark the config as ready?
-		return ctrl.Result{}, nil
-	}
 
 	// Lookup the cluster the machine is associated with
 	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, machine.ObjectMeta)
@@ -140,10 +128,45 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		return ctrl.Result{}, err
 	}
 
+	switch {
 	// Wait patiently for the infrastructure to be ready
-	if !cluster.Status.InfrastructureReady {
+	case !cluster.Status.InfrastructureReady:
 		log.Info("Infrastructure is not ready, waiting until ready.")
 		return ctrl.Result{}, nil
+	// bail super early if it's already ready
+	case config.Status.Ready && machine.Status.InfrastructureReady:
+		log.Info("ignoring config for an already ready machine")
+		return ctrl.Result{}, nil
+	// Reconcile status for machines that have already copied bootstrap data
+	case machine.Spec.Bootstrap.Data != nil && !config.Status.Ready:
+		config.Status.Ready = true
+		// Initialize the patch helper
+		patchHelper, err := patch.NewHelper(config, r)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		err = patchHelper.Patch(ctx, config)
+		return ctrl.Result{}, err
+	// If we've already embedded a time-limited join token into a config, but are still waiting for the token to be used, refresh it
+	case config.Status.Ready && (config.Spec.JoinConfiguration != nil && config.Spec.JoinConfiguration.Discovery.BootstrapToken != nil):
+		token := config.Spec.JoinConfiguration.Discovery.BootstrapToken.Token
+
+		// gets the remote secret interface client for the current cluster
+		secretsClient, err := r.SecretsClientFactory.NewSecretsClient(r.Client, cluster)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		log.Info("refreshing token until the infrastructure has a chance to consume it")
+		err = refreshToken(secretsClient, token)
+		if err != nil {
+			// It would be nice to re-create the bootstrap token if the error was "not found", but we have no way to update the Machine's bootstrap data
+			return ctrl.Result{}, errors.Wrapf(err, "failed to refresh bootstrap token")
+		}
+		// NB: this may not be sufficient to keep the token live if we don't see it before it expires, but when we generate a config we will set the status to "ready" which should generate an update event
+		return ctrl.Result{
+			RequeueAfter: DefaultTokenTTL / 2,
+		}, nil
 	}
 
 	// Initialize the patch helper
@@ -189,6 +212,8 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 
 		log.Info("Creating BootstrapData for the init control plane")
 
+		// Nb. in this case JoinConfiguration should not be defined by users, but in case of misconfigurations, CABPK simply ignore it
+
 		// get both of ClusterConfiguration and InitConfiguration strings to pass to the cloud init control plane generator
 		// kubeadm allows one of these values to be empty; CABPK replace missing values with an empty config, so the cloud init generation
 		// should not handle special cases.
@@ -225,7 +250,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 			return ctrl.Result{}, err
 		}
 
-		certificates := internalcluster.NewCertificates()
+		certificates := internalcluster.NewCertificatesForInitialControlPlane(config.Spec.ClusterConfiguration)
 		if err := certificates.LookupOrGenerate(ctx, r.Client, cluster, config); err != nil {
 			log.Error(err, "unable to lookup or create cluster certificates")
 			return ctrl.Result{}, err
@@ -255,58 +280,50 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 	}
 
 	// Every other case it's a join scenario
-	// Nb. in this case ClusterConfiguration and JoinConfiguration should not be defined by users, but in case of misconfigurations, CABPK simply ignore them
+	// Nb. in this case ClusterConfiguration and InitConfiguration should not be defined by users, but in case of misconfigurations, CABPK simply ignore them
 
 	// Unlock any locks that might have been set during init process
 	r.KubeadmInitLock.Unlock(ctx, cluster)
 
+	// if the JoinConfiguration is missing, create a default one
 	if config.Spec.JoinConfiguration == nil {
-		return ctrl.Result{}, errors.New("Control plane already exists for the cluster, only KubeadmConfig objects with JoinConfiguration are allowed")
-	}
-
-	certificates := internalcluster.NewCertificates()
-	if err := certificates.Lookup(ctx, r.Client, cluster); err != nil {
-		log.Error(err, "unable to lookup cluster certificates")
-		return ctrl.Result{}, err
-	}
-	if err := certificates.EnsureAllExist(); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	hashes, err := certificates.GetByPurpose(secret.ClusterCA).Hashes()
-	if err != nil {
-		log.Error(err, "Unable to generate Cluster CA certificate hashes")
-		return ctrl.Result{}, err
-	}
-	// TODO: move this into reconcile.Discovery so that defaults for the Discovery are all in the same place
-	if config.Spec.JoinConfiguration.Discovery.BootstrapToken == nil {
-		config.Spec.JoinConfiguration.Discovery.BootstrapToken = &kubeadmv1beta1.BootstrapTokenDiscovery{}
-	}
-	config.Spec.JoinConfiguration.Discovery.BootstrapToken.CACertHashes = hashes
-
-	// ensure that joinConfiguration.Discovery is properly set for joining node on the current cluster
-	if err := r.reconcileDiscovery(cluster, config); err != nil {
-		if requeueErr, ok := errors.Cause(err).(capierrors.HasRequeueAfterError); ok {
-			log.Info(err.Error())
-			return ctrl.Result{RequeueAfter: requeueErr.GetRequeueAfter()}, nil
-		}
-		return ctrl.Result{}, err
-	}
-
-	joindata, err := kubeadmv1beta1.ConfigurationToYAML(config.Spec.JoinConfiguration)
-	if err != nil {
-		log.Error(err, "failed to marshal join configuration")
-		return ctrl.Result{}, err
+		log.Info("Creating default JoinConfiguration")
+		config.Spec.JoinConfiguration = &kubeadmv1beta1.JoinConfiguration{}
 	}
 
 	// it's a control plane join
 	if util.IsControlPlaneMachine(machine) {
 		if config.Spec.JoinConfiguration.ControlPlane == nil {
-			return ctrl.Result{}, errors.New("Machine is a ControlPlane, but JoinConfiguration.ControlPlane is not set in the KubeadmConfig object")
+			config.Spec.JoinConfiguration.ControlPlane = &kubeadmv1beta1.JoinControlPlane{}
 		}
 
+		certificates := internalcluster.NewCertificatesForJoiningControlPlane()
+		if err := certificates.Lookup(ctx, r.Client, cluster); err != nil {
+			log.Error(err, "unable to lookup cluster certificates")
+			return ctrl.Result{}, err
+		}
+		if err := certificates.EnsureAllExist(); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// ensure that joinConfiguration.Discovery is properly set for joining node on the current cluster
+		if err := r.reconcileDiscovery(cluster, config, certificates); err != nil {
+			if requeueErr, ok := errors.Cause(err).(capierrors.HasRequeueAfterError); ok {
+				log.Info(err.Error())
+				return ctrl.Result{RequeueAfter: requeueErr.GetRequeueAfter()}, nil
+			}
+			return ctrl.Result{}, err
+		}
+
+		joinData, err := kubeadmv1beta1.ConfigurationToYAML(config.Spec.JoinConfiguration)
+		if err != nil {
+			log.Error(err, "failed to marshal join configuration")
+			return ctrl.Result{}, err
+		}
+
+		log.Info("Creating BootstrapData for the join control plane")
 		cloudJoinData, err := cloudinit.NewJoinControlPlane(&cloudinit.ControlPlaneJoinInput{
-			JoinConfiguration: joindata,
+			JoinConfiguration: joinData,
 			Certificates:      certificates,
 			BaseUserData: cloudinit.BaseUserData{
 				AdditionalFiles:     config.Spec.Files,
@@ -326,10 +343,37 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		return ctrl.Result{}, nil
 	}
 
-	// otherwise it is a node
+	// It's a worker join
+	certificates := internalcluster.NewCertificatesForWorker(config.Spec.JoinConfiguration.CACertPath)
+	if err := certificates.Lookup(ctx, r.Client, cluster); err != nil {
+		log.Error(err, "unable to lookup cluster certificates")
+		return ctrl.Result{}, err
+	}
+	if err := certificates.EnsureAllExist(); err != nil {
+		log.Error(err, "Missing certificates")
+		return ctrl.Result{}, err
+	}
+
+	// ensure that joinConfiguration.Discovery is properly set for joining node on the current cluster
+	if err := r.reconcileDiscovery(cluster, config, certificates); err != nil {
+		if requeueErr, ok := errors.Cause(err).(capierrors.HasRequeueAfterError); ok {
+			log.Info(err.Error())
+			return ctrl.Result{RequeueAfter: requeueErr.GetRequeueAfter()}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	joinData, err := kubeadmv1beta1.ConfigurationToYAML(config.Spec.JoinConfiguration)
+	if err != nil {
+		log.Error(err, "failed to marshal join configuration")
+		return ctrl.Result{}, err
+	}
+
 	if config.Spec.JoinConfiguration.ControlPlane != nil {
 		return ctrl.Result{}, errors.New("Machine is a Worker, but JoinConfiguration.ControlPlane is set in the KubeadmConfig object")
 	}
+
+	log.Info("Creating BootstrapData for the worker node")
 
 	cloudJoinData, err := cloudinit.NewNode(&cloudinit.NodeInput{
 		BaseUserData: cloudinit.BaseUserData{
@@ -339,7 +383,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 			PostKubeadmCommands: config.Spec.PostKubeadmCommands,
 			Users:               config.Spec.Users,
 		},
-		JoinConfiguration: joindata,
+		JoinConfiguration: joinData,
 	})
 	if err != nil {
 		log.Error(err, "failed to create a worker join configuration")
@@ -405,7 +449,7 @@ func (r *KubeadmConfigReconciler) MachineToBootstrapMapFunc(o handler.MapObject)
 // The implementation func respect user provided discovery configurations, but in case some of them are missing, a valid BootstrapToken object
 // is automatically injected into config.JoinConfiguration.Discovery.
 // This allows to simplify configuration UX, by providing the option to delegate to CABPK the configuration of kubeadm join discovery.
-func (r *KubeadmConfigReconciler) reconcileDiscovery(cluster *clusterv1.Cluster, config *bootstrapv1.KubeadmConfig) error {
+func (r *KubeadmConfigReconciler) reconcileDiscovery(cluster *clusterv1.Cluster, config *bootstrapv1.KubeadmConfig, certificates internalcluster.Certificates) error {
 	log := r.Log.WithValues("kubeadmconfig", fmt.Sprintf("%s/%s", config.Namespace, config.Name))
 
 	// if config already contains a file discovery configuration, respect it without further validations
@@ -416,6 +460,16 @@ func (r *KubeadmConfigReconciler) reconcileDiscovery(cluster *clusterv1.Cluster,
 	// otherwise it is necessary to ensure token discovery is properly configured
 	if config.Spec.JoinConfiguration.Discovery.BootstrapToken == nil {
 		config.Spec.JoinConfiguration.Discovery.BootstrapToken = &kubeadmv1beta1.BootstrapTokenDiscovery{}
+	}
+
+	// calculate the ca cert hashes if they are not already set
+	if len(config.Spec.JoinConfiguration.Discovery.BootstrapToken.CACertHashes) == 0 {
+		hashes, err := certificates.GetByPurpose(secret.ClusterCA).Hashes()
+		if err != nil {
+			log.Error(err, "Unable to generate Cluster CA certificate hashes")
+			return err
+		}
+		config.Spec.JoinConfiguration.Discovery.BootstrapToken.CACertHashes = hashes
 	}
 
 	// if BootstrapToken already contains an APIServerEndpoint, respect it; otherwise inject the APIServerEndpoint endpoint defined in cluster status
