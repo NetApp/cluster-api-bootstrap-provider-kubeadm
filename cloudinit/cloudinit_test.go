@@ -21,7 +21,8 @@ import (
 	"testing"
 
 	infrav1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/api/v1alpha2"
-	"sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/certs"
+	"sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/internal/cluster"
+	"sigs.k8s.io/cluster-api/util/certs"
 )
 
 func TestNewInitControlPlaneAdditionalFileEncodings(t *testing.T) {
@@ -45,26 +46,16 @@ func TestNewInitControlPlaneAdditionalFileEncodings(t *testing.T) {
 			Users:      nil,
 			NTP:        nil,
 		},
-		Certificates: certs.Certificates{
-			ClusterCA: &certs.KeyPair{
-				Cert: []byte("ca cert"),
-				Key:  []byte("ca key"),
-			},
-			EtcdCA: &certs.KeyPair{
-				Cert: []byte("etcd ca cert"),
-				Key:  []byte("etcd ca key"),
-			},
-			FrontProxyCA: &certs.KeyPair{
-				Cert: []byte("front proxy ca cert"),
-				Key:  []byte("front proxy ca key"),
-			},
-			ServiceAccount: &certs.KeyPair{
-				Cert: []byte("service account ca cert"),
-				Key:  []byte("service account ca key"),
-			},
-		},
+		Certificates:         cluster.Certificates{},
 		ClusterConfiguration: "my-cluster-config",
 		InitConfiguration:    "my-init-config",
+	}
+
+	for _, certificate := range cpinput.Certificates {
+		certificate.KeyPair = &certs.KeyPair{
+			Cert: []byte("some certificate"),
+			Key:  []byte("some key"),
+		}
 	}
 
 	out, err := NewInitControlPlane(cpinput)
@@ -81,6 +72,44 @@ func TestNewInitControlPlaneAdditionalFileEncodings(t *testing.T) {
       hi`,
 	}
 	for _, f := range expectedFiles {
+		if !bytes.Contains(out, []byte(f)) {
+			t.Errorf("%s\ndid not contain\n%s", out, f)
+		}
+	}
+}
+
+func TestNewInitControlPlaneCommands(t *testing.T) {
+	cpinput := &ControlPlaneInput{
+		BaseUserData: BaseUserData{
+			Header:              "test",
+			PreKubeadmCommands:  []string{`"echo $(date) ': hello world!'"`},
+			PostKubeadmCommands: []string{"echo $(date) ': hello world!'"},
+			AdditionalFiles:     nil,
+			WriteFiles:          nil,
+			Users:               nil,
+			NTP:                 nil,
+		},
+		Certificates:         cluster.Certificates{},
+		ClusterConfiguration: "my-cluster-config",
+		InitConfiguration:    "my-init-config",
+	}
+
+	for _, certificate := range cpinput.Certificates {
+		certificate.KeyPair = &certs.KeyPair{
+			Cert: []byte("some certificate"),
+			Key:  []byte("some key"),
+		}
+	}
+
+	out, err := NewInitControlPlane(cpinput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedCommands := []string{
+		`"\"echo $(date) ': hello world!'\""`,
+		`"echo $(date) ': hello world!'"`,
+	}
+	for _, f := range expectedCommands {
 		if !bytes.Contains(out, []byte(f)) {
 			t.Errorf("%s\ndid not contain\n%s", out, f)
 		}

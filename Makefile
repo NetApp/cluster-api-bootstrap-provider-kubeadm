@@ -15,7 +15,10 @@
 # If you update this file, please follow:
 # https://suva.sh/posts/well-documented-makefiles/
 
-.DEFAULT_GOAL:=help
+.DEFAULT_GOAL := help
+
+# Active go module, as we use it to manage dependencies
+export GO111MODULE := on
 
 # Use GOPROXY environment variable if set
 GOPROXY := $(shell go env GOPROXY)
@@ -48,6 +51,8 @@ CONTROLLER_GEN_BIN := bin/controller-gen
 CONTROLLER_GEN := $(TOOLS_DIR)/$(CONTROLLER_GEN_BIN)
 GOLANGCI_LINT_BIN := bin/golangci-lint
 GOLANGCI_LINT := $(TOOLS_DIR)/$(GOLANGCI_LINT_BIN)
+RELEASE_NOTES_BIN := bin/release-notes
+RELEASE_NOTES := $(TOOLS_DIR)/$(RELEASE_NOTES_BIN)
 
 # Allow overriding manifest generation destination directory
 MANIFEST_ROOT ?= "config"
@@ -55,47 +60,54 @@ CRD_ROOT ?= "$(MANIFEST_ROOT)/crd/bases"
 WEBHOOK_ROOT ?= "$(MANIFEST_ROOT)/webhook"
 RBAC_ROOT ?= "$(MANIFEST_ROOT)/rbac"
 
-# Active module mode, as we use go modules to manage dependencies
-export GO111MODULE=on
-
 .PHONY: all
 all: manager
 
 help:  ## Display this help
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+## --------------------------------------
+## Testing
+## --------------------------------------
 
 .PHONY: test
-test: generate fmt vet ## Run tests
+test: generate lint ## Run tests
 	go test ./... -coverprofile cover.out
 
+## --------------------------------------
+## Binaries
+## --------------------------------------
+
 .PHONY: manager
-manager: generate fmt vet ## Build manager binary
+manager: generate lint ## Build manager binary
 	go build -o bin/manager main.go
 
-.PHONY: run
-run: generate fmt vet ## Run against the configured Kubernetes cluster in ~/.kube/config
-	go run ./main.go
+# Build controller-gen
+$(CONTROLLER_GEN): $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && go build -o $(CONTROLLER_GEN_BIN) sigs.k8s.io/controller-tools/cmd/controller-gen
 
-.PHONY: install
-install: generate ## Install CRDs into a cluster
-	kubectl apply -f config/crd/bases
+# Build golangci-lint
+$(GOLANGCI_LINT): $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && go build -o $(GOLANGCI_LINT_BIN) github.com/golangci/golangci-lint/cmd/golangci-lint
 
-.PHONY: deploy
-deploy: generate ## Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-	kubectl apply -f config/crd/bases
-	kubectl kustomize config/default | kubectl apply -f -
+$(RELEASE_NOTES) : $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && go build -o $(RELEASE_NOTES_BIN) -tags tools sigs.k8s.io/cluster-api/hack/tools/release
 
-.PHONY: fmt
-fmt: ## Run go fmt against code
-	go fmt ./...
+## --------------------------------------
+## Linting
+## --------------------------------------
 
-.PHONY: vet
-vet: ## Run go vet against code
-	go vet ./...
+.PHONY: lint
+lint: $(GOLANGCI_LINT) ## Lint quickly using `golangci-lint --fast=true`
+	$(GOLANGCI_LINT) run -v --fast=true
 
-.PHONY: golangci-lint
-golangci-lint: $(GOLANGCI_LINT) ## Run golangci-lint against code
-	$(GOLANGCI_LINT) run
+.PHONY: lint-full
+lint-full: $(GOLANGCI_LINT) ## Lint thoroughly using `golangci-lint --fase=false`
+	$(GOLANGCI_LINT) run -v --fast=false
+
+## --------------------------------------
+## Generate / Manifests
+## --------------------------------------
 
 .PHONY: generate
 generate: $(CONTROLLER_GEN) ## Generate code
@@ -103,19 +115,17 @@ generate: $(CONTROLLER_GEN) ## Generate code
 	$(MAKE) generate-deepcopy
 
 .PHONY: generate-deepcopy
-generate-deepcopy: $(CONTROLLER_GEN) ## Generate deepcopy files.
+generate-deepcopy: $(CONTROLLER_GEN) ## Generate deepcopy files
 	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate/boilerplate.generatego.txt paths=./api/...
 
 .PHONY: generate-manifests
-generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc.
+generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:dir=$(CRD_ROOT) output:webhook:dir=$(WEBHOOK_ROOT) output:rbac:dir=$(RBAC_ROOT)
 
-# Build controller-gen
-$(CONTROLLER_GEN): $(TOOLS_DIR)/go.mod
-	cd $(TOOLS_DIR) && go build -o $(CONTROLLER_GEN_BIN) sigs.k8s.io/controller-tools/cmd/controller-gen
-# Build golangci-lint
-$(GOLANGCI_LINT): $(TOOLS_DIR)/go.mod
-	cd $(TOOLS_DIR) && go build -o $(GOLANGCI_LINT_BIN) github.com/golangci/golangci-lint/cmd/golangci-lint
+.PHONY: modules
+modules: ## Runs go mod to ensure modules are up to date.
+	go mod tidy
+	cd $(TOOLS_DIR); go mod tidy
 
 ## --------------------------------------
 ## Docker
@@ -165,9 +175,13 @@ set-manifest-image:
 ## --------------------------------------
 
 RELEASE_TAG := $(shell git describe --abbrev=0 2>/dev/null)
+RELEASE_DIR := out
+
+$(RELEASE_DIR):
+	mkdir -p $(RELEASE_DIR)/
 
 .PHONY: release
-release:  ## Builds and push container images using the latest git tag for the commit.
+release: clean-release  ## Builds and push container images using the latest git tag for the commit.
 	@if [ -z "${RELEASE_TAG}" ]; then echo "RELEASE_TAG is not set"; exit 1; fi
 	# Push the release image to the staging bucket first.
 	REGISTRY=$(STAGING_REGISTRY) TAG=$(RELEASE_TAG) \
@@ -175,11 +189,51 @@ release:  ## Builds and push container images using the latest git tag for the c
 	# Set the manifest image to the production bucket.
 	MANIFEST_IMG=$(PROD_REGISTRY)/$(IMAGE_NAME) MANIFEST_TAG=$(RELEASE_TAG) \
 		$(MAKE) set-manifest-image
-	# Generate release artifacts.
-	mkdir -p out/
-	kustomize build config/default > out/bootstrap-components.yaml
+	$(MAKE) release-manifests
 
-.PHONY: release-staging-latest
-release-staging-latest: ## Builds and push container images to the staging bucket using "latest" tag.
-	REGISTRY=$(STAGING_REGISTRY) TAG=latest \
-		$(MAKE) docker-build-all docker-push-all
+.PHONY: release-manifests
+release-manifests: $(RELEASE_DIR) ## Builds the manifests to publish with a release
+	kustomize build config/default > $(RELEASE_DIR)/bootstrap-components.yaml
+
+.PHONY: release-staging
+release-staging: ## Builds and push container images to the staging bucket.
+	REGISTRY=$(STAGING_REGISTRY) $(MAKE) docker-build-all docker-push-all release-alias-tag
+
+RELEASE_ALIAS_TAG=$(shell if [ "$(PULL_BASE_REF)" = "master" ]; then echo "latest"; else echo "$(PULL_BASE_REF)"; fi)
+
+.PHONY: release-alias-tag
+release-alias-tag: # Adds the tag to the last build tag.
+	gcloud container images add-tag $(CONTROLLER_IMG):$(TAG) $(CONTROLLER_IMG):$(RELEASE_ALIAS_TAG)
+
+.PHONY: release-notes
+release-notes: $(RELEASE_NOTES)
+	$(RELEASE_NOTES)
+
+## --------------------------------------
+## Cleanup / Verification
+## --------------------------------------
+
+.PHONY: clean
+clean: ## Remove all generated files
+	$(MAKE) clean-release
+
+.PHONY: clean-release
+clean-release: ## Remove the release folder
+	rm -rf $(RELEASE_DIR)
+
+## --------------------------------------
+## Others / Utilities
+## --------------------------------------
+
+.PHONY: run
+run: generate lint ## Run against the configured Kubernetes cluster in ~/.kube/config
+	go run ./main.go
+
+.PHONY: install
+install: generate ## Install CRDs into a cluster
+	kubectl apply -f config/crd/bases
+
+.PHONY: deploy
+deploy: generate ## Deploy controller in the configured Kubernetes cluster in ~/.kube/config
+	kubectl apply -f config/crd/bases
+	kubectl kustomize config/default | kubectl apply -f -
